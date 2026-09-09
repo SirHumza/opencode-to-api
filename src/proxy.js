@@ -8,7 +8,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import { buildPromptParts, parseModel } from './util.js';
+import { buildPromptParts, parseModel, formatToolsPrompt, parseInvokes, stripInvokes } from './util.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -394,6 +394,45 @@ function createApp(config) {
         };
     };
 
+    // Generic streaming tag filter: hides <tag>...</tag> blocks (e.g. invoke payloads)
+    // from streamed deltas while letting surrounding text through.
+    const createTagFilter = (tag, enabled) => {
+        if (!enabled) return (chunk) => chunk;
+        const open = `<${tag}>`;
+        const close = `</${tag}>`;
+        let inBlock = false;
+        let buf = '';
+        return (chunk) => {
+            if (!chunk) return chunk;
+            buf += chunk;
+            let output = '';
+            for (;;) {
+                if (inBlock) {
+                    const endIdx = buf.indexOf(close);
+                    if (endIdx === -1) {
+                        if (buf.length > 4096) buf = buf.slice(-4096);
+                        return output;
+                    }
+                    buf = buf.slice(endIdx + close.length);
+                    inBlock = false;
+                    continue;
+                }
+                const startIdx = buf.indexOf(open);
+                if (startIdx === -1) {
+                    // Keep a tail in case the tag is split across chunks
+                    const keep = Math.max(0, buf.length - (open.length + 32));
+                    output += buf.slice(0, keep);
+                    buf = buf.slice(keep);
+                    if (!buf) return output;
+                    return output;
+                }
+                output += buf.slice(0, startIdx);
+                buf = buf.slice(startIdx + open.length);
+                inBlock = true;
+            }
+        };
+    };
+
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
     let cachedToolOverrides = null;
     let cachedToolAt = 0;
@@ -627,7 +666,7 @@ function createApp(config) {
                 await acquireSlot();
                 slotHeld = true;
                 try {
-                    const { messages, model, stream } = req.body;
+                    const { messages, model, stream, tools, tool_choice } = req.body;
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
                         return res.status(400).json({ error: { message: 'messages array is required' } });
                     }
@@ -635,7 +674,12 @@ function createApp(config) {
                     const { providerID: pID, modelID: mID } = parseModel(model);
 
                     const { parts, system: systemMsg, lastUserMsg } = buildPromptParts(messages);
-                    const systemWithGuard = applyToolGuard(systemMsg);
+                    // Client-defined tools are translated into prompt instructions (see util.js);
+                    // the model answers with <invoke> blocks we convert to OpenAI tool_calls.
+                    const toolsPrompt = formatToolsPrompt(tools, tool_choice);
+                    const systemCombined = [systemMsg, toolsPrompt].filter((s) => s && s.trim()).join('\n\n');
+                    const systemWithGuard = applyToolGuard(systemCombined);
+                    const toolsActive = Boolean(toolsPrompt);
                     if (!parts.length) {
                         return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
                     }
@@ -689,12 +733,18 @@ function createApp(config) {
                         const id = `chatcmpl-${Date.now()}`;
                         const filterContentDelta = createToolCallFilter();
                         const filterReasoningDelta = createToolCallFilter();
+                        const filterInvokeContent = createTagFilter('invoke', toolsActive);
                         let streamedContent = '';
                         let streamedReasoning = '';
+                        let rawStreamedContent = '';
 
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
-                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!isReasoning) rawStreamedContent += delta;
+                            let filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!filtered) return;
+                            // Hide raw <invoke> JSON from the visible stream; tool_calls go in the final chunk.
+                            if (toolsActive && !isReasoning) filtered = filterInvokeContent(filtered);
                             if (!filtered) return;
                             if (isReasoning) {
                                 streamedReasoning += filtered;
@@ -783,7 +833,32 @@ function createApp(config) {
                             if (collected.content) sendDelta(collected.content, false);
                         }
 
-                        res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+                        // Client tool calls: raw stream still holds <invoke> blocks the filter hid.
+                        const streamInvokes = toolsActive
+                            ? parseInvokes(rawStreamedContent + (collected?.content || ''))
+                            : [];
+                        if (streamInvokes.length) {
+                            res.write(`data: ${JSON.stringify({
+                                id,
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: `${pID}/${mID}`,
+                                choices: [{
+                                    index: 0,
+                                    delta: {
+                                        tool_calls: streamInvokes.map((c, i) => ({
+                                            index: i,
+                                            id: c.id,
+                                            type: 'function',
+                                            function: { name: c.name, arguments: c.arguments },
+                                        })),
+                                    },
+                                    finish_reason: 'tool_calls',
+                                }],
+                            })}\n\n`);
+                        } else {
+                            res.write(`data: ${JSON.stringify({ id, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
+                        }
                         res.write('data: [DONE]\n\n');
                         res.end();
                     } else {
@@ -801,6 +876,30 @@ function createApp(config) {
                         }
                         const safeContent = stripFunctionCalls(content);
                         const safeReasoning = stripFunctionCalls(reasoning);
+
+                        const invokes = toolsActive ? parseInvokes(content || '') : [];
+                        if (invokes.length) {
+                            return res.json({
+                                id: `chatcmpl-${Date.now()}`,
+                                object: 'chat.completion',
+                                created: Math.floor(Date.now() / 1000),
+                                model: `${pID}/${mID}`,
+                                choices: [{
+                                    index: 0,
+                                    message: {
+                                        role: 'assistant',
+                                        content: stripInvokes(safeContent) || null,
+                                        tool_calls: invokes.map((c) => ({
+                                            id: c.id,
+                                            type: 'function',
+                                            function: { name: c.name, arguments: c.arguments },
+                                        })),
+                                    },
+                                    finish_reason: 'tool_calls'
+                                }],
+                                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                            });
+                        }
 
                         res.json({
                             id: `chatcmpl-${Date.now()}`,
