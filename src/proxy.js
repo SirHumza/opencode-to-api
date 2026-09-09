@@ -11,18 +11,16 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// --- Mutex Logic with Timeout ---
-const queue = [];
-let isProcessing = false;
-
-const STARTUP_WAIT_ITERATIONS = 60;
+// --- Concurrency: no global mutex (backend handles parallel sessions) ---
+// Kept constants for tuning; lock removed for stability under concurrent clients.
+const STARTUP_WAIT_ITERATIONS = 30;
 const STARTUP_WAIT_INTERVAL_MS = 2000;
-const STARTING_WAIT_ITERATIONS = 120;
+const STARTING_WAIT_ITERATIONS = 30;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
-const DEFAULT_POLL_INTERVAL_MS = 500;
-const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
-const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
+const DEFAULT_POLL_INTERVAL_MS = 1000;
+const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 30000;
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 60000;
 
 const OPENCODE_BASENAME = 'opencode';
 
@@ -170,43 +168,10 @@ function resolveOpencodePath(requestedPath) {
     return { path: null, source: 'not-found' };
 }
 
-function processQueue() {
-    if (isProcessing || queue.length === 0) return;
-    isProcessing = true;
-    const { task, timeout, resolve, reject } = queue.shift();
-    let settled = false;
-    const timeoutMs = timeout || 120000;
-    const timeoutId = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        reject(new Error(`Request timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    Promise.resolve()
-        .then(() => task())
-        .then((result) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            resolve(result);
-        })
-        .catch((err) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timeoutId);
-            reject(err);
-        })
-        .finally(() => {
-            isProcessing = false;
-            setTimeout(processQueue, 100);
-        });
-}
-
-function lock(task, timeout = 120000) {
-    return new Promise((resolve, reject) => {
-        queue.push({ task, timeout, resolve, reject });
-        processQueue();
-    });
+// Direct execution: allow concurrent requests. Each chat uses its own OpenCode session,
+// so serializing globally only causes false timeouts under Cursor/Claude parallel calls.
+function lock(task) {
+    return Promise.resolve().then(() => task());
 }
 
 /**
@@ -332,7 +297,10 @@ function createApp(config) {
             res.json({ object: 'list', data: models });
         } catch (error) {
             console.error('[Proxy] Model Fetch Error:', error.message);
-            res.json({ object: 'list', data: [{ id: 'opencode/kimi-k2.5-free', object: 'model' }] });
+            // Don't hide backend failure with a fake model - surface it so clients retry correctly.
+            if (!res.headersSent) {
+                return res.status(502).json({ error: { message: `Backend unavailable: ${error.message}`, type: 'BackendError' } });
+            }
         }
     });
 
@@ -592,13 +560,22 @@ function createApp(config) {
         }
     }
 
-    // Chat completions endpoint
-    app.post('/v1/chat/completions', async (req, res) => {
+    // Chat completions endpoint (concurrent-safe: no global lock)
+    const cleanupSession = async (sid) => {
+        if (!sid) return;
         try {
-            await lock(async () => {
-                let sessionId = null;
-                let eventStream = null;
+            await client.session.delete({ path: { id: sid } });
+        } catch (e) {
+            logDebug('Session cleanup failed', { sessionId: sid, error: e.message });
+        }
+    };
 
+    app.post('/v1/chat/completions', async (req, res) => {
+        let sessionId = null;
+        let eventStream = null;
+        let cleanedUp = false;
+        const markCleaned = () => { cleanedUp = true; };
+        try {
                 try {
                     const { messages, model, stream } = req.body;
                     if (!messages || !Array.isArray(messages) || messages.length === 0) {
@@ -848,14 +825,22 @@ function createApp(config) {
                     }
                 } finally {
                     if (eventStream && eventStream.close) {
-                        eventStream.close();
+                        try { eventStream.close(); } catch (e) { /* ignore */ }
+                    }
+                    // Always cleanup session to prevent backend storage leak (was error-only before).
+                    if (sessionId && !cleanedUp) {
+                        markCleaned();
+                        await cleanupSession(sessionId);
                     }
                 }
-            }, REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
             console.error('[Proxy] Request Handler Error:', error.message);
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
+            }
+            if (sessionId && !cleanedUp) {
+                markCleaned();
+                await cleanupSession(sessionId);
             }
         }
     });
@@ -869,41 +854,61 @@ function createApp(config) {
     return { app, client };
 }
 
-// Backend management state (per-instance)
+// Backend management state (per-instance) with single-flight + health cache
 const backendState = new Map();
 
+function getBackendPort(serverUrl) {
+    try {
+        const u = new URL(serverUrl);
+        if (u.port) return u.port;
+        return u.protocol === 'https:' ? '443' : '80';
+    } catch (e) {
+        const m = String(serverUrl).match(/:(\d+)/);
+        return m ? m[1] : '4097';
+    }
+}
+
 /**
- * Backend Lifecycle Management
+ * Backend Lifecycle Management (single-flight, concurrent-safe)
  */
 async function ensureBackend(config) {
-    const { OPENCODE_SERVER_URL, OPENCODE_PATH, USE_ISOLATED_HOME, BACKEND_AUTH } = config;
+    const { OPENCODE_SERVER_URL, OPENCODE_PATH, USE_ISOLATED_HOME } = config;
     const stateKey = OPENCODE_SERVER_URL;
 
     if (!backendState.has(stateKey)) {
         backendState.set(stateKey, {
-            isStarting: false,
             process: null,
-            jailRoot: null
+            jailRoot: null,
+            startingPromise: null,
+            lastHealthyAt: 0,
         });
     }
 
     const state = backendState.get(stateKey);
 
-    if (state.isStarting) {
-        // Wait for startup to complete
-        for (let i = 0; i < STARTING_WAIT_ITERATIONS; i++) {
-            await new Promise(r => setTimeout(r, STARTING_WAIT_INTERVAL_MS));
-            try {
-                await checkHealth(OPENCODE_SERVER_URL, config.BACKEND_AUTH);
-                return;
-            } catch (e) { }
-        }
-        throw new Error('Backend startup timeout');
-    }
-
+    // Fast path: cached healthy within 5s to avoid health storm under concurrency
+    if (Date.now() - state.lastHealthyAt < 5000) return;
     try {
         await checkHealth(OPENCODE_SERVER_URL, config.BACKEND_AUTH);
+        state.lastHealthyAt = Date.now();
+        return;
     } catch (err) {
+        // fall through to single-flight startup
+    }
+
+    if (state.startingPromise) {
+        await state.startingPromise;
+        return;
+    }
+
+    state.startingPromise = (async () => {
+        // Re-check after acquiring single-flight
+        try {
+            await checkHealth(OPENCODE_SERVER_URL, config.BACKEND_AUTH);
+            state.lastHealthyAt = Date.now();
+            return;
+        } catch (e) { /* need start */ }
+    {
         state.isStarting = true;
         console.log(`[Proxy] OpenCode backend not found at ${OPENCODE_SERVER_URL}. Starting...`);
 
@@ -987,8 +992,7 @@ async function ensureBackend(config) {
             }
         }
 
-        const [, , portStr] = OPENCODE_SERVER_URL.split(':');
-        const port = portStr ? portStr.split('/')[0] : '4097';
+        const port = getBackendPort(OPENCODE_SERVER_URL);
         const resolved = resolveOpencodePath(OPENCODE_PATH);
         const opencodeBin = resolved.path || OPENCODE_PATH || OPENCODE_BASENAME;
         if (resolved.path) {
@@ -997,49 +1001,72 @@ async function ensureBackend(config) {
             console.warn(`[Proxy] Unable to resolve OpenCode binary for '${OPENCODE_PATH}'. Using as-is.`);
         }
 
-        // Cross-platform spawn options
+        // Cross-platform spawn options - pipe logs instead of inherit to avoid interleaved stdout
         const useShell = process.platform === 'win32' || !resolved.path ||
             opencodeBin.endsWith('.cmd') || opencodeBin.endsWith('.bat');
         const spawnOptions = {
-            stdio: 'inherit',
+            stdio: ['ignore', 'pipe', 'pipe'],
             cwd: cwd,
             env: envVars,
-            shell: useShell  // Use shell only when needed (e.g., Windows .cmd or unresolved PATH)
+            shell: useShell
         };
 
-        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', '127.0.0.1'], spawnOptions);
+        // Kill stale process if any
+        if (state.process) {
+            try { state.process.kill(); } catch (e) { /* ignore */ }
+            state.process = null;
+        }
+        // Cleanup old temp dir
+        if (state.jailRoot && fs.existsSync(state.jailRoot)) {
+            try { fs.rmSync(state.jailRoot, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+        }
 
-        // Handle spawn errors
+        state.process = spawn(opencodeBin, ['serve', '--port', port, '--hostname', '127.0.0.1'], spawnOptions);
+        if (state.process.stdout) state.process.stdout.on('data', (d) => process.stdout.write(`[opencode] ${d}`));
+        if (state.process.stderr) state.process.stderr.on('data', (d) => process.stderr.write(`[opencode:err] ${d}`));
+
+        // Handle spawn errors + unexpected exit (auto-clear so next request restarts)
         state.process.on('error', (err) => {
             console.error(`[Proxy] Failed to spawn OpenCode: ${err.message}`);
             if (err.code === 'ENOENT') {
                 console.error(`[Proxy] Command '${OPENCODE_PATH}' not found. Please ensure OpenCode is installed and in your PATH.`);
-                console.error(`[Proxy] You can specify the full path in config.json using 'OPENCODE_PATH'`);
             }
+            state.process = null;
+            state.lastHealthyAt = 0;
+        });
+        state.process.on('exit', (code, signal) => {
+            console.warn(`[Proxy] OpenCode backend exited code=${code} signal=${signal}. Will restart on next request.`);
+            state.process = null;
+            state.lastHealthyAt = 0;
         });
 
         // Wait for backend to be ready
         let started = false;
         for (let i = 0; i < STARTUP_WAIT_ITERATIONS; i++) {
-            console.log(`[Proxy] Waiting for backend... attempt ${i + 1}/${STARTUP_WAIT_ITERATIONS}`);
             await new Promise(r => setTimeout(r, STARTUP_WAIT_INTERVAL_MS));
             try {
                 await checkHealth(OPENCODE_SERVER_URL, config.BACKEND_AUTH);
                 console.log('[Proxy] OpenCode backend ready.');
                 started = true;
+                state.lastHealthyAt = Date.now();
                 break;
             } catch (e) {
-                console.log(`[Proxy] Health check failed: ${e.message}`);
+                if (i % 5 === 0) console.log(`[Proxy] Waiting for backend... attempt ${i + 1}/${STARTUP_WAIT_ITERATIONS}`);
             }
         }
 
-        state.isStarting = false;
-
         if (!started) {
             console.warn('[Proxy] Backend start timed out.');
+            try { state.process?.kill(); } catch (e) { /* ignore */ }
+            state.process = null;
             throw new Error('Backend start timeout');
         }
-    }
+        }
+    })().finally(() => {
+        const s = backendState.get(stateKey);
+        if (s) s.startingPromise = null;
+    });
+    await state.startingPromise;
 }
 
 /**
